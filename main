@@ -1,0 +1,706 @@
+
+import 'dart:math';
+import 'package:flutter/material.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const EngagementApp());
+}
+
+class EngagementApp extends StatelessWidget {
+  const EngagementApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'ECLearnix Engagement Accelerator',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: const Color(0xFF3D5AFE),
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+// -----------------------------
+// Simple domain + persistence
+// -----------------------------
+class Store {
+  // Naive in-memory store (replace with Hive/SharedPrefs in prod)
+  static final Store _i = Store._();
+  Store._();
+  factory Store() => _i;
+
+  // engagement
+  int streak = 0; // consecutive days with completion
+  DateTime? lastActivity; // last completion time
+  int lessonsCompleted = 0; // total completions
+
+  // experiment bucket (A/B)
+  late final String variant = _bucket();
+
+  // analytics event log
+  final List<AnalyticsEvent> events = [];
+
+  String _bucket() {
+    // Stable-ish variant by randomizing once per run. Replace with deviceId hash
+    return Random().nextBool() ? 'A' : 'B';
+  }
+
+  void log(String name, {Map<String, dynamic>? props}) {
+    final evt = AnalyticsEvent(name: name, props: props ?? {});
+    events.add(evt);
+    // print(evt); // for debugging
+  }
+
+  void completeLesson() {
+    final today = DateUtils.dateOnly(DateTime.now());
+    final last = lastActivity == null ? null : DateUtils.dateOnly(lastActivity!);
+    if (last == null) {
+      streak = 1;
+    } else if (today.difference(last).inDays == 0) {
+      // same day repeat — don’t grow streak twice per day
+    } else if (today.difference(last).inDays == 1) {
+      streak += 1;
+    } else {
+      streak = 1; // reset after gap
+    }
+    lastActivity = DateTime.now();
+    lessonsCompleted += 1;
+    log('lesson_completed', props: {
+      'streak': streak,
+      'total': lessonsCompleted,
+      'date': today.toIso8601String(),
+    });
+  }
+
+  int daysSinceLastActivity() {
+    if (lastActivity == null) return 999;
+    final today = DateUtils.dateOnly(DateTime.now());
+    final last = DateUtils.dateOnly(lastActivity!);
+    return today.difference(last).inDays;
+  }
+}
+
+class AnalyticsEvent {
+  final String name;
+  final Map<String, dynamic> props;
+  final DateTime ts;
+  AnalyticsEvent({required this.name, required this.props}) : ts = DateTime.now();
+  @override
+  String toString() => '[${ts.toIso8601String()}] $name ${props.toString()}';
+}
+
+// -----------------------------
+// Home — streaks, AB banner, nudge
+// -----------------------------
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final store = Store();
+
+  @override
+  void initState() {
+    super.initState();
+    store.log('app_opened', props: {'variant': store.variant});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final gapDays = store.daysSinceLastActivity();
+    final showNudge = gapDays >= 2; // Inactivity threshold for reminder banner
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ECLearnix'),
+        actions: [
+          IconButton(
+            tooltip: 'Analytics',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AnalyticsScreen()),
+            ),
+            icon: const Icon(Icons.analytics_outlined),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _ExperimentBanner(variant: store.variant),
+          const SizedBox(height: 12),
+          if (showNudge) _ReminderNudge(gapDays: gapDays, onResume: _resumeCTA),
+          const SizedBox(height: 12),
+          _StreakCard(streak: store.streak, last: store.lastActivity),
+          const SizedBox(height: 12),
+          _CourseGrid(onOpen: _openLesson),
+        ],
+      ),
+    );
+  }
+
+  void _resumeCTA() {
+    Store().log('nudge_clicked');
+    _openLesson('Quick Revision');
+  }
+
+  void _openLesson(String title) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => LessonScreen(title: title)),
+    );
+    // After returning, consider a micro-survey trigger
+    if (Store().lessonsCompleted % 3 == 0) {
+      _showSurvey();
+    }
+    setState(() {}); // refresh streak/nudge
+  }
+
+  void _showSurvey() async {
+    final rating = await showDialog<int>(
+      context: context,
+      builder: (ctx) => const _NpsDialog(),
+    );
+    if (rating == null) return;
+
+    final why = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _ReasonDialog(rating: rating),
+    );
+
+    Store().log('nps_submitted', props: {'rating': rating, 'reason': why ?? ''});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Thanks for the feedback!')),
+    );
+  }
+}
+
+class _ExperimentBanner extends StatelessWidget {
+  const _ExperimentBanner({required this.variant});
+  final String variant; // 'A' or 'B'
+
+  @override
+  Widget build(BuildContext context) {
+    final isA = variant == 'A';
+    final title = isA ? 'Get Certified Faster' : 'Join Live Doubt Solves';
+    final sub = isA
+        ? 'Finish 1 micro-module daily and earn a course certificate sooner.'
+        : 'Hop into tonight\'s 30-min doubt session and unblock your progress.';
+    final cta = isA ? 'See Roadmap' : 'Book a Slot';
+
+    return _HeroCard(
+      title: title,
+      subtitle: sub,
+      ctaText: cta,
+      icon: isA ? Icons.verified_outlined : Icons.live_tv_outlined,
+      onTap: () {
+        Store().log('hero_cta_clicked', props: {'variant': variant});
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const RoadmapScreen()),
+        );
+      },
+    );
+  }
+}
+
+class _ReminderNudge extends StatelessWidget {
+  const _ReminderNudge({required this.gapDays, required this.onResume});
+  final int gapDays;
+  final VoidCallback onResume;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          children: [
+            const Icon(Icons.notifications_active_outlined, size: 28),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                gapDays == 2
+                    ? 'Welcome back! Resume your streak today.'
+                    : 'It\'s been $gapDays days — a quick refresher boosts memory.',
+                style: Theme.of(context).textTheme.bodyLarge,
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton(onPressed: onResume, child: const Text('Resume')),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StreakCard extends StatelessWidget {
+  const _StreakCard({required this.streak, required this.last});
+  final int streak;
+  final DateTime? last;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Row(
+          children: [
+            const Icon(Icons.local_fire_department_outlined, size: 36),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Current Streak: $streak day${streak == 1 ? '' : 's'}',
+                      style: textTheme.titleLarge),
+                  const SizedBox(height: 4),
+                  Text(
+                    last == null
+                        ? 'Start learning to begin your streak'
+                        : 'Last activity: ${_prettyDate(last!)}',
+                  ),
+                ],
+              ),
+            ),
+            FilledButton(
+              onPressed: () => _startQuickLesson(context),
+              child: const Text('Start 5-min'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static String _prettyDate(DateTime dt) {
+    final d = DateUtils.dateOnly(dt);
+    final today = DateUtils.dateOnly(DateTime.now());
+    final diff = today.difference(d).inDays;
+    if (diff == 0) return 'today';
+    if (diff == 1) return 'yesterday';
+    return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+  }
+
+  void _startQuickLesson(BuildContext context) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const LessonScreen(title: '5-min Recap')),
+    );
+  }
+}
+
+class _CourseGrid extends StatelessWidget {
+  const _CourseGrid({required this.onOpen});
+  final void Function(String title) onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final courses = [
+      ('Python Basics', Icons.code),
+      ('Data Viz 101', Icons.bar_chart),
+      ('SQL Crash Course', Icons.storage),
+      ('ML Starter Pack', Icons.auto_awesome),
+    ];
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: courses.length,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        childAspectRatio: 1.2,
+        mainAxisSpacing: 12,
+        crossAxisSpacing: 12,
+      ),
+      itemBuilder: (ctx, i) {
+        final c = courses[i];
+        return _CourseCard(
+          title: c.$1,
+          icon: c.$2 as IconData,
+          onTap: () => onOpen(c.$1),
+        );
+      },
+    );
+  }
+}
+
+class _CourseCard extends StatelessWidget {
+  const _CourseCard({required this.title, required this.icon, required this.onTap});
+  final String title;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(20),
+      child: Ink(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(20),
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(icon, size: 32),
+              const Spacer(),
+              Text(title, style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              const Row(
+                children: [
+                  Icon(Icons.play_circle_outline, size: 18),
+                  SizedBox(width: 6),
+                  Text('Start'),
+                ],
+              )
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HeroCard extends StatelessWidget {
+  const _HeroCard({
+    required this.title,
+    required this.subtitle,
+    required this.ctaText,
+    required this.icon,
+    required this.onTap,
+  });
+  final String title;
+  final String subtitle;
+  final String ctaText;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Theme.of(context).colorScheme.primaryContainer,
+            Theme.of(context).colorScheme.tertiaryContainer,
+          ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(24),
+      ),
+      padding: const EdgeInsets.all(20),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 42),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: Theme.of(context).textTheme.headlineSmall),
+                const SizedBox(height: 6),
+                Text(subtitle),
+                const SizedBox(height: 12),
+                FilledButton.tonal(onPressed: onTap, child: Text(ctaText)),
+              ],
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
+
+// -----------------------------
+// Lesson flow
+// -----------------------------
+class LessonScreen extends StatefulWidget {
+  const LessonScreen({super.key, required this.title});
+  final String title;
+
+  @override
+  State<LessonScreen> createState() => _LessonScreenState();
+}
+
+class _LessonScreenState extends State<LessonScreen> {
+  int step = 0;
+  final steps = const [
+    'Watch short concept video',
+    'Attempt 3 quiz questions',
+    'Review quick summary',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    Store().log('lesson_opened', props: {'title': widget.title});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isLast = step == steps.length - 1;
+
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title)),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            LinearProgressIndicator(value: (step + 1) / steps.length),
+            const SizedBox(height: 16),
+            Text('Step ${step + 1} of ${steps.length}',
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text(steps[step], style: Theme.of(context).textTheme.titleLarge),
+            const Spacer(),
+            Row(
+              children: [
+                OutlinedButton(
+                  onPressed: step == 0
+                      ? null
+                      : () => setState(() => step = max(0, step - 1)),
+                  child: const Text('Back'),
+                ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: () {
+                    if (isLast) {
+                      Store().completeLesson();
+                      if (!mounted) return;
+                      Navigator.pop(context);
+                    } else {
+                      setState(() => step += 1);
+                    }
+                  },
+                  child: Text(isLast ? 'Finish' : 'Next'),
+                ),
+              ],
+            )
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// -----------------------------
+// Roadmap (CTA destination)
+// -----------------------------
+class RoadmapScreen extends StatelessWidget {
+  const RoadmapScreen({super.key});
+  @override
+  Widget build(BuildContext context) {
+    final points = [
+      'Daily 5-min recap',
+      'Weekly live mentor check-in',
+      'Monthly project & certificate',
+    ];
+    return Scaffold(
+      appBar: AppBar(title: const Text('Your Roadmap')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'Finish one micro-module per day to stay on track. Here\'s your plan:',
+          ),
+          const SizedBox(height: 12),
+          ...points.map((p) => ListTile(
+            leading: const Icon(Icons.check_circle_outline),
+            title: Text(p),
+          )),
+        ],
+      ),
+    );
+  }
+}
+
+// -----------------------------
+// Micro-survey dialogs
+// -----------------------------
+class _NpsDialog extends StatefulWidget {
+  const _NpsDialog();
+  @override
+  State<_NpsDialog> createState() => _NpsDialogState();
+}
+
+class _NpsDialogState extends State<_NpsDialog> {
+  int rating = 8;
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('How likely to recommend ECLearnix?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Slider(
+            value: rating.toDouble(),
+            divisions: 10,
+            min: 0,
+            max: 10,
+            label: '$rating',
+            onChanged: (v) => setState(() => rating = v.round()),
+          ),
+          const Text('0 = Not at all, 10 = Definitely'),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(context, rating), child: const Text('Next')),
+      ],
+    );
+  }
+}
+
+class _ReasonDialog extends StatefulWidget {
+  const _ReasonDialog({required this.rating});
+  final int rating;
+  @override
+  State<_ReasonDialog> createState() => _ReasonDialogState();
+}
+
+class _ReasonDialogState extends State<_ReasonDialog> {
+  final ctrl = TextEditingController();
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Thanks! Why ${{'${widget.rating}'}}?'),
+      content: TextField(
+        controller: ctrl,
+        decoration: const InputDecoration(
+          hintText: 'Tell us a bit (optional)',
+          border: OutlineInputBorder(),
+        ),
+        maxLines: 4,
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context, ''), child: const Text('Skip')),
+        FilledButton(onPressed: () => Navigator.pop(context, ctrl.text.trim()), child: const Text('Submit')),
+      ],
+    );
+  }
+}
+
+// -----------------------------
+// Analytics console
+// -----------------------------
+class AnalyticsScreen extends StatelessWidget {
+  const AnalyticsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = Store();
+    final events = s.events.reversed.toList();
+    final heroClicks = events.where((e) => e.name == 'hero_cta_clicked').length;
+    final opens = events.where((e) => e.name == 'app_opened').length;
+    final heroCtr = opens == 0 ? 0 : heroClicks / opens;
+
+    final lessonCompletions = events.where((e) => e.name == 'lesson_completed').length;
+    final nps = events.where((e) => e.name == 'nps_submitted').toList();
+    final npsAvg = nps.isEmpty
+        ? 0
+        : nps.map((e) => (e.props['rating'] ?? 0) as num).reduce((a, b) => a + b) /
+        nps.length;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Analytics Console')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              _StatCard(title: 'Variant', value: s.variant),
+              _StatCard(title: 'App Opens', value: '$opens'),
+              _StatCard(title: 'Hero CTR', value: '${(heroCtr * 100).toStringAsFixed(1)}%'),
+              _StatCard(title: 'Completions', value: '$lessonCompletions'),
+              _StatCard(title: 'Avg NPS', value: nps.isEmpty ? '-' : npsAvg.toStringAsFixed(1)),
+              _StatCard(title: 'Streak', value: '${s.streak}d'),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text('Events (${events.length})', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          ...events.map((e) => ListTile(
+            leading: const Icon(Icons.bolt_outlined),
+            title: Text(e.name),
+            subtitle: Text(e.props.toString()),
+            trailing: Text(timeOfDayFmt(e.ts)),
+          )),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: () => _exportCSV(context, events),
+            icon: const Icon(Icons.download_outlined),
+            label: const Text('Export CSV (mock)'),
+          )
+        ],
+      ),
+    );
+  }
+
+  static String timeOfDayFmt(DateTime dt) {
+    final h = dt.hour.toString().padLeft(2, '0');
+    final m = dt.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
+  void _exportCSV(BuildContext context, List<AnalyticsEvent> events) {
+    final header = 'ts,name,props\n';
+    final rows = events
+        .map((e) => '${e.ts.toIso8601String()},${e.name},"${e.props.toString().replaceAll('"', '\\"')}"')
+        .join('\n');
+    final csv = header + rows;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('CSV Preview'),
+        content: SingleChildScrollView(child: Text(csv)),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+      ),
+    );
+  }
+}
+
+class _StatCard extends StatelessWidget {
+  const _StatCard({required this.title, required this.value});
+  final String title;
+  final String value;
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 160,
+      child: Card(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: Theme.of(context).textTheme.labelLarge),
+              const SizedBox(height: 6),
+              Text(value, style: Theme.of(context).textTheme.headlineSmall),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
